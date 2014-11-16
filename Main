@@ -1,0 +1,1183 @@
+package ca.ryerson.transgames;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.HttpVersion;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.mime.HttpMultipartMode;
+import org.apache.http.entity.mime.MultipartEntityBuilder;
+import org.apache.http.entity.mime.content.FileBody;
+import org.apache.http.impl.client.DefaultHttpClient;
+import org.apache.http.params.BasicHttpParams;
+import org.apache.http.params.CoreProtocolPNames;
+import org.apache.http.params.HttpParams;
+import org.apache.http.util.EntityUtils;
+
+import ca.ryerson.transgames.utility.*;
+
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.GooglePlayServicesClient.OnConnectionFailedListener;
+import com.google.android.gms.common.GooglePlayServicesClient.ConnectionCallbacks;
+import com.google.android.gms.location.LocationClient;
+import com.google.android.gms.location.LocationListener;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.maps.CameraUpdateFactory;
+import com.google.android.gms.maps.GoogleMap;
+import com.google.android.gms.maps.SupportMapFragment;
+import com.google.android.gms.maps.model.LatLng;
+
+import android.support.v4.app.FragmentActivity;
+import android.annotation.SuppressLint;
+import android.app.AlertDialog;
+import android.app.ProgressDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.media.AudioManager;
+import android.media.MediaPlayer;
+import android.media.RingtoneManager;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Message;
+import android.os.Vibrator;
+import android.provider.Settings.Secure;
+import android.util.Log;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.widget.Toast;
+
+public class MainActivity extends FragmentActivity implements LocationListener,
+		ConnectionCallbacks, OnConnectionFailedListener, SensorEventListener {
+	private GoogleMap mMap;
+	private LocationClient mLocationClient;
+	private Location mLocation;
+
+	private static final int mTrackFreq = 3; // seconds
+	private static final LatLng Toronto = new LatLng(43.65521, -79.38353);
+	// These settings are the same as the settings for the map. They will in
+	// fact give you updates at
+	// the maximal rates currently possible.
+	private static final LocationRequest REQUEST = LocationRequest.create()
+			.setInterval(5000) // 5 seconds
+			.setFastestInterval(16) // 16ms = 60fps
+			.setPriority(LocationRequest.PRIORITY_HIGH_ACCURACY);
+
+	private Boolean mShareLoc = false;
+	private Thread mShareLocThread = null;
+	
+	private Boolean mReceiveMsg = false, mReceivingMsg = false;
+	private Thread mReceivingMsgThread = null;
+	private String mReceiveMsgStr = "";
+	private AlertDialog mGetMsgDlg = null;
+	private ScheduledExecutorService  mRecieveMsgScheduleTaskExecutor;
+	@SuppressLint("HandlerLeak")
+	private final Handler mMsgShowDlgHdl = new Handler() {
+		public void handleMessage(Message msg) {
+			if (msg.arg1 == 1)
+				mGetMsgDlg.cancel();
+			else
+			{
+				AlertDialog.Builder alertDialogBuilder = new AlertDialog.Builder(
+						MainActivity.this);
+				alertDialogBuilder.setTitle("Receive Message");
+				alertDialogBuilder.setMessage(mReceiveMsgStr);
+				alertDialogBuilder.setPositiveButton("Ok",
+						new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface dialog, int id) {
+								// go to a new activity
+								dialog.cancel();
+							}
+						});
+				mGetMsgDlg = alertDialogBuilder.create();
+				mGetMsgDlg.show();
+				
+				try {
+					playSound(getApplicationContext());
+				} catch (IllegalArgumentException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (SecurityException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (IllegalStateException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+		}
+	};
+	
+	private ScheduledExecutorService mTrackScheduleTaskExecutor;
+	private TransFileWriter mTransFileWriter;
+	private TextView mNoiseLevel = null;
+	private String mDeviceID = "";
+	private Sensor mIllumination; // illumination
+	private SensorManager mSensorManager;
+	private double mLight;
+
+	private Thread mUploadThread = null;
+	public ProgressDialog mPrgsDlg = null;
+	@SuppressLint("HandlerLeak")
+	private final Handler mPgsHdler = new Handler() {
+		public void handleMessage(Message msg) {
+			if (msg.arg1 == 1)
+				mPrgsDlg.cancel();
+			else
+				mPrgsDlg.show();
+		}
+	};
+	@SuppressLint("HandlerLeak")
+	private final Handler handler = new Handler() {
+		public void handleMessage(Message msg) {
+			if (msg.arg1 == 1)
+				Toast.makeText(getApplicationContext(), "Upload success",
+						Toast.LENGTH_LONG).show();
+			else
+				Toast.makeText(getApplicationContext(), "Upload failed",
+						Toast.LENGTH_LONG).show();
+		}
+	};
+
+	private Thread mCheckInThread = null;	
+	@SuppressLint("HandlerLeak")
+	private final Handler handlerCheck = new Handler() {
+		public void handleMessage(Message msg) {
+
+			if (msg.arg1 == 1)
+				Toast.makeText(getApplicationContext(), "Check in success",
+						Toast.LENGTH_LONG).show();
+			else
+				Toast.makeText(getApplicationContext(), "Check in failed",
+						Toast.LENGTH_LONG).show();
+		}
+	};
+	
+	private Thread mSendMessageThread = null;
+	@SuppressLint("HandlerLeak")
+	private final Handler handlerMsg = new Handler() {
+		public void handleMessage(Message msg) {
+
+			if (msg.arg1 == 1)
+				Toast.makeText(getApplicationContext(), "Message send success",
+						Toast.LENGTH_LONG).show();
+			else
+				Toast.makeText(getApplicationContext(), "Messgae send failed",
+						Toast.LENGTH_LONG).show();
+		}
+	};
+
+	private Vibrator mVib = null;
+
+	@Override
+	protected void onCreate(Bundle savedInstanceState) {
+		super.onCreate(savedInstanceState);
+		setContentView(R.layout.activity_main);
+
+		setUpMapIfNeeded();
+		setUpLocationClientIfNeeded();
+
+		mDeviceID = Secure.getString(this.getContentResolver(),
+				Secure.ANDROID_ID);
+
+		mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(Toronto, 10));
+
+		if (mNoiseLevel == null) {
+			mNoiseLevel = (TextView) findViewById(R.id.tvStart);
+			mNoiseLevel.setBackgroundColor(Color.rgb(224, 224, 224));
+			// mNoiseLevel.setTextColor(color.white);
+			mNoiseLevel.setText("Records");
+		}
+
+		mTransFileWriter = new TransFileWriter(this.getApplicationContext());
+
+		mSensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+		mIllumination = mSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT); // illumination
+
+		mPrgsDlg = new ProgressDialog(this);
+		
+		mVib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+		// Output yes if can vibrate, no otherwise
+		if (mVib.hasVibrator()) {
+		    Log.v("Can Vibrate", "YES");
+		} else {
+		    Log.v("Can Vibrate", "NO");
+		}
+	}
+
+	@Override
+	public boolean onCreateOptionsMenu(Menu menu) {
+		// Inflate the menu; this adds items to the action bar if it is present.
+		getMenuInflater().inflate(R.menu.main, menu);
+		return true;
+	}
+
+	@Override
+	public boolean onOptionsItemSelected(MenuItem item) {
+		// Handle action bar item clicks here. The action bar will
+		// automatically handle clicks on the Home/Up button, so long
+		// as you specify a parent activity in AndroidManifest.xml.
+
+		switch (item.getItemId()) {
+		case R.id.track_location:
+			trackAlert();
+			return true;
+		case R.id.upload_trajectory:
+			mPrgsDlg.setTitle("Uploading to server");
+			mPrgsDlg.setMessage("Running...");
+			if (mUploadThread != null && mUploadThread.isAlive()) {
+				mPrgsDlg.show();
+			} else
+				uploadStartAlert();
+			return true;
+		case R.id.check_in:
+			mPrgsDlg.setTitle("Check in to server");
+			mPrgsDlg.setMessage("Checking...");
+			if (mCheckInThread != null && mCheckInThread.isAlive()) {
+				mPrgsDlg.show();
+			} else
+				checkInAlert();
+			return true;
+		case R.id.send_msg:
+			mPrgsDlg.setTitle("Send message to server");
+			mPrgsDlg.setMessage("Sending...");
+			if (mSendMessageThread != null && mSendMessageThread.isAlive()) {
+				mPrgsDlg.show();
+			} else
+				sendMsgAlert();
+			return true;
+		case R.id.action_settings:
+			settingsAlert();
+		}
+
+		/*
+		 * int id = item.getItemId(); if (id == R.id.action_settings) { return
+		 * true; }
+		 */
+		return super.onOptionsItemSelected(item);
+	}
+	
+	public void playSound(Context context) throws IllegalArgumentException,
+			SecurityException, IllegalStateException, IOException {
+
+		Uri soundUri = RingtoneManager
+				.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+		MediaPlayer mMediaPlayer = new MediaPlayer();
+		mMediaPlayer.setDataSource(context, soundUri);
+		final AudioManager audioManager = (AudioManager) context
+				.getSystemService(Context.AUDIO_SERVICE);
+
+		if (audioManager.getStreamVolume(AudioManager.STREAM_ALARM) != 0) {
+			mMediaPlayer.setAudioStreamType(AudioManager.STREAM_ALARM);
+			mMediaPlayer.setLooping(false);
+			mMediaPlayer.prepare();
+			mMediaPlayer.start();
+		}
+}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		setUpMapIfNeeded();
+		setUpLocationClientIfNeeded();
+
+		// setup location sensors
+		mLocationClient.connect();
+
+		mSensorManager.registerListener(this, mIllumination,
+				SensorManager.SENSOR_DELAY_NORMAL);
+	}
+
+	
+	@Override
+	public void onLocationChanged(Location pLoc) {
+		// TODO Auto-generated method stub
+		mLocation = pLoc;
+
+		if (!mShareLoc) {
+			if (mShareLocThread != null) {
+				mShareLocThread.interrupt();
+			}
+			mShareLocThread = null;
+			return;
+		}
+
+		if (mShareLocThread == null) {
+			Toast.makeText(getApplicationContext(), "Location sharing starts",
+					Toast.LENGTH_LONG).show();
+			createSharLocThread();
+			mShareLocThread.start();
+		} else {
+			if (mShareLocThread.getState().equals(Thread.State.NEW))
+				mShareLocThread.start();
+			else {
+				mShareLocThread = null;
+				createSharLocThread();
+				mShareLocThread.start();
+			}
+			
+		}
+	}
+
+	private void createSharLocThread() {
+		mShareLocThread = new Thread(new Runnable() {
+			public void run() {
+				runOnUiThread(new Runnable() {
+					public void run() {
+					}
+				});
+				sharingGamerLoc(mLocation);
+			}
+		});
+	}
+	
+	private void sharingGamerLoc(Location pLoc) {	
+		MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+		builder.setMode(HttpMultipartMode.BROWSER_COMPATIBLE);
+
+		builder.addTextBody("pAction", "TransDeviceUpdate",
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pDeviceID", mDeviceID,
+				ContentType.APPLICATION_JSON);
+		
+		builder.addTextBody("pLat", String.valueOf(pLoc.getLatitude()),
+				ContentType.APPLICATION_JSON);
+
+		builder.addTextBody("pLon", String.valueOf(pLoc.getLongitude()),
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pType", "0",
+				ContentType.APPLICATION_JSON);
+
+		HttpEntity myEntity = builder.build();
+
+		HttpParams params = new BasicHttpParams();
+		params.setParameter(CoreProtocolPNames.PROTOCOL_VERSION,
+				HttpVersion.HTTP_1_1);
+		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpPost httppost = new HttpPost(getString(R.string.mHostURL));
+
+		httppost.setEntity(myEntity);
+		try {
+			httpclient.execute(httppost, new shareLocResponseHandler());
+		} catch (ClientProtocolException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();			
+			mShareLocThread.interrupt();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+			mShareLocThread.interrupt();
+		}
+	}
+
+	class shareLocResponseHandler implements ResponseHandler<Object> {
+		@Override
+		public Object handleResponse(HttpResponse response)
+				throws ClientProtocolException, IOException {
+			HttpEntity r_entity = response.getEntity();
+			String responseString = EntityUtils.toString(r_entity);
+			// Log.d("UPLOAD", responseString);
+		
+			if (responseString.equalsIgnoreCase("ok")) {
+				
+				try {
+
+				} catch (Exception e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			} else {
+			
+			}
+			return null;
+		}
+	}
+
+	
+	
+	@Override
+	public void onConnectionFailed(ConnectionResult arg0) {
+		// TODO Auto-generated method stub
+
+	}
+
+	@Override
+	public void onConnected(Bundle arg0) {
+		// TODO Auto-generated method stub
+		mLocationClient.requestLocationUpdates(REQUEST, this); // LocationListener
+	}
+
+	@Override
+	public void onPause() {
+		super.onPause();
+		if (mLocationClient != null) {
+
+			// disconnect location sensors
+			mLocationClient.disconnect();
+		}
+
+		// disconnect sensor manager
+		mSensorManager.unregisterListener(this);
+	}
+
+	@Override
+	public void onDisconnected() {
+		// TODO Auto-generated method stub
+
+	}
+
+	@Override
+	public void onSensorChanged(SensorEvent event) {
+		// TODO Auto-generated method stub
+
+		// Toast.makeText(getApplicationContext(), event.sensor.getName(),
+		// Toast.LENGTH_LONG).show();
+		if (event.sensor.getType() == Sensor.TYPE_LIGHT) {
+			// System.out.println("Light is: " + event.values[0]);
+			mLight = event.values[0];
+		}
+		if (event.sensor.getType() == Sensor.TYPE_AMBIENT_TEMPERATURE) {
+			System.out.println("Temperature is: " + event.values[0]);
+		}
+	}
+
+	@Override
+	public void onAccuracyChanged(Sensor sensor, int accuracy) {
+		// TODO Auto-generated method stub
+
+	}
+
+	// ----------- user functions -----------------
+
+	private void settingsAlert() {
+		final View settingsView = View.inflate(this, R.layout.settings_layout,
+				null);
+		CheckBox pckbxShareLoc = (CheckBox) settingsView
+				.findViewById(R.id.ckboxShareLoc);
+		pckbxShareLoc.setChecked(mShareLoc);
+		CheckBox pckbxGetMsg = (CheckBox) settingsView
+				.findViewById(R.id.ckbxReceiveMsg);
+		pckbxGetMsg.setChecked(this.mReceiveMsg);
+
+		AlertDialog.Builder builder = new AlertDialog.Builder(this);
+		builder.setTitle(this.getTitle() + " settings")
+				// .setMessage("Do you want to send message?")
+				.setView(settingsView)
+				.setNegativeButton("Cancel",
+						new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface dialog, int id) {
+							}
+						})
+
+				.setPositiveButton("Ok", new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface dialog, int which) {
+						// User pressed Cancel button. Write Logic Here
+						CheckBox pckbxShareLoc = (CheckBox) settingsView
+								.findViewById(R.id.ckboxShareLoc);
+						CheckBox pckbxGetMsg = (CheckBox) settingsView
+								.findViewById(R.id.ckbxReceiveMsg);
+
+						mShareLoc = pckbxShareLoc.isChecked();
+
+						mReceiveMsg = pckbxGetMsg.isChecked();
+						if (!mReceiveMsg) {
+							mReceivingMsg = false;
+							if (mRecieveMsgScheduleTaskExecutor != null) {
+								mRecieveMsgScheduleTaskExecutor.shutdown();
+								mRecieveMsgScheduleTaskExecutor = null;
+							}
+						} else {
+							if (mRecieveMsgScheduleTaskExecutor == null)
+							{
+								Toast.makeText(getApplicationContext(), "Receive message starts",
+										Toast.LENGTH_SHORT).show();
+								startReceiveMsg();
+							}
+						}
+					}
+				}).show();
+
+	}
+
+	public void startReceiveMsg() {
+		mRecieveMsgScheduleTaskExecutor = Executors.newScheduledThreadPool(mTrackFreq);
+		// This schedule a runnable task every mTrackFreq (3) seconds
+		mRecieveMsgScheduleTaskExecutor.scheduleAtFixedRate(new Runnable() {
+			public void run() {
+				runOnUiThread(new Runnable() {
+					@Override
+					public void run() {
+						mReceivingMsg = false;
+						if (mReceivingMsgThread == null) {
+							createReceiveMsgThread();
+							mReceivingMsgThread.start();
+						} else {
+							if (mReceivingMsgThread.getState().equals(Thread.State.NEW))
+								mReceivingMsgThread.start();
+							else {
+								mReceivingMsgThread = null;
+								createReceiveMsgThread();
+								mReceivingMsgThread.start();
+							}
+						}
+						
+					}
+				});
+
+			}
+		}, 0, mTrackFreq, TimeUnit.SECONDS);
+
+	}
+	
+	private void createReceiveMsgThread() {
+		mReceivingMsgThread = new Thread(new Runnable() {
+			public void run() {
+				runOnUiThread(new Runnable() {
+					public void run() {
+					}
+				});
+				receiveMsg();
+			}
+		});
+	}
+
+	public void receiveMsg() {
+		if(mReceivingMsg)
+			return;
+		
+		mReceivingMsg = true;
+		MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+		builder.setMode(HttpMultipartMode.BROWSER_COMPATIBLE);
+
+		builder.addTextBody("pAction", "TransGetMsg",
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pDeviceID", mDeviceID,
+				ContentType.APPLICATION_JSON);
+		
+		HttpEntity myEntity = builder.build();
+
+		HttpParams params = new BasicHttpParams();
+		params.setParameter(CoreProtocolPNames.PROTOCOL_VERSION,
+				HttpVersion.HTTP_1_1);
+		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpPost httppost = new HttpPost(getString(R.string.mHostURL));
+
+		httppost.setEntity(myEntity);
+		try {
+			httpclient.execute(httppost, new receiveMsgResponseHandler());
+		} catch (ClientProtocolException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			mReceivingMsg = false;
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			mReceivingMsg = false;
+		}
+	}
+
+	class receiveMsgResponseHandler implements ResponseHandler<Object> {
+		@Override
+		public Object handleResponse(HttpResponse response)
+				throws ClientProtocolException, IOException {
+			HttpEntity r_entity = response.getEntity();
+			String responseString = EntityUtils.toString(r_entity);
+			if(responseString.isEmpty())
+				return null;
+			
+			mReceiveMsgStr = "";
+			String[] arrayRes = responseString.split("@");
+			for(int i=0;i<arrayRes.length;i++) {
+				mReceiveMsgStr = mReceiveMsgStr + arrayRes[i] +"\n";
+			}
+			
+			Message msg1 = mMsgShowDlgHdl.obtainMessage();
+			msg1.arg1 = 2;
+			mMsgShowDlgHdl.sendMessage(msg1);
+			
+			mReceivingMsg = false;
+			return null;
+		}
+	}
+	
+
+	
+	private void sendMsgAlert() {
+		final View messageView = View.inflate(this, R.layout.message_layout,
+				null);
+
+		AlertDialog.Builder builder = new AlertDialog.Builder(this);
+		builder.setTitle(this.getTitle())
+				.setMessage("Do you want to send message?")
+				.setView(messageView)
+				.setNegativeButton("No", new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface dialog, int id) {
+					}
+				})
+
+				.setPositiveButton("Yes",
+						new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface dialog,
+									int which) {
+								// User pressed Cancel button. Write Logic Here
+
+								mSendMessageThread = new Thread(new Runnable() {
+									public void run() {
+										runOnUiThread(new Runnable() {
+											public void run() {
+											}
+										});
+										EditText pETxtMsg = (EditText) messageView.findViewById(R.id.etxtMsg);
+										String etxtMsgStr = pETxtMsg.getText().toString();
+										sendMsg(etxtMsgStr);
+									}
+								});
+
+								mSendMessageThread.start();
+							}
+						}).show();
+
+	}
+
+	private void sendMsg(String etxtMsgStr) {
+		Message msg1 = mPgsHdler.obtainMessage();
+		msg1.arg1 = 2;
+		mPgsHdler.sendMessage(msg1);
+
+		MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+		builder.setMode(HttpMultipartMode.BROWSER_COMPATIBLE);
+
+		builder.addTextBody("pAction", "TransSendMsg",
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pDeviceID", mDeviceID,
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pTarget", "Server",
+				ContentType.APPLICATION_JSON);
+
+		builder.addTextBody("pMsg", etxtMsgStr, ContentType.APPLICATION_JSON);
+
+		HttpEntity myEntity = builder.build();
+
+		HttpParams params = new BasicHttpParams();
+		params.setParameter(CoreProtocolPNames.PROTOCOL_VERSION,
+				HttpVersion.HTTP_1_1);
+		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpPost httppost = new HttpPost(getString(R.string.mHostURL));
+
+		httppost.setEntity(myEntity);
+		try {
+			httpclient.execute(httppost, new sendMsgResponseHandler());
+		} catch (ClientProtocolException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			Message msg = handlerMsg.obtainMessage();
+			msg.arg1 = 2;
+			msg.arg2 = 1;
+			handlerMsg.sendMessage(msg);
+			mPrgsDlg.cancel();
+			this.mSendMessageThread.interrupt();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			Message msg = handlerMsg.obtainMessage();
+			msg.arg1 = 2;
+			msg.arg2 = 2;
+			handlerMsg.sendMessage(msg);
+			mPrgsDlg.cancel();
+		}
+	}
+	
+	class sendMsgResponseHandler implements ResponseHandler<Object> {
+		@Override
+		public Object handleResponse(HttpResponse response)
+				throws ClientProtocolException, IOException {
+			HttpEntity r_entity = response.getEntity();
+			String responseString = EntityUtils.toString(r_entity);
+			// Log.d("UPLOAD", responseString);
+
+			Message msg1 = mPgsHdler.obtainMessage();
+			msg1.arg1 = 1;
+			mPgsHdler.sendMessage(msg1);
+
+			if (responseString.equalsIgnoreCase("ok")) {
+				Message msg = handlerMsg.obtainMessage();
+				msg.arg1 = 1;
+				handlerMsg.sendMessage(msg);
+				try {
+
+				} catch (Exception e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			} else {
+				Message msg = handlerMsg.obtainMessage();
+				msg.arg1 = 2;
+				handlerMsg.sendMessage(msg);
+			}
+
+			return null;
+		}
+	}
+
+	private void checkInAlert() {
+		final View checkView = View.inflate(this, R.layout.check_in_layout,
+				null);
+
+		AlertDialog.Builder builder = new AlertDialog.Builder(this);
+		builder.setTitle(this.getTitle())
+				.setMessage("Do you want to check in now?")
+				.setView(checkView)
+				.setNegativeButton("Cancel",
+						new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface dialog, int id) {
+							}
+						})
+
+				.setPositiveButton("Yes",
+						new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface dialog,
+									int which) {
+								// User pressed Cancel button. Write Logic Here
+
+								mCheckInThread = new Thread(new Runnable() {
+									public void run() {
+										runOnUiThread(new Runnable() {
+											public void run() {
+											}
+										});
+										EditText pETxtMemo = (EditText) checkView
+												.findViewById(R.id.etxtMemo);
+										String etxtMemoStr = pETxtMemo
+												.getText().toString();
+										checkIn(etxtMemoStr);
+									}
+								});
+
+								mCheckInThread.start();
+							}
+						}).show();
+	}
+
+	private void checkIn(String etxtMemoStr) {
+		Message msg1 = mPgsHdler.obtainMessage();
+		msg1.arg1 = 1;
+		mPgsHdler.sendMessage(msg1);
+
+		MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+		builder.setMode(HttpMultipartMode.BROWSER_COMPATIBLE);
+		
+		builder.addTextBody("pAction", "TransGamerCheckIn",
+				ContentType.APPLICATION_JSON);
+		builder.addTextBody("pDeviceID", mDeviceID,
+				ContentType.APPLICATION_JSON);
+
+		builder.addTextBody("pLat", String.valueOf(mLocation.getLatitude()),
+				ContentType.APPLICATION_JSON);
+
+		builder.addTextBody("pLon", String.valueOf(mLocation.getLongitude()),
+				ContentType.APPLICATION_JSON);
+
+		builder.addTextBody("pMsg", etxtMemoStr, ContentType.APPLICATION_JSON);
+
+		HttpEntity myEntity = builder.build();
+
+		HttpParams params = new BasicHttpParams();
+		params.setParameter(CoreProtocolPNames.PROTOCOL_VERSION,
+				HttpVersion.HTTP_1_1);
+		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpPost httppost = new HttpPost(getString(R.string.mHostURL));
+
+		httppost.setEntity(myEntity);
+		try {
+			httpclient.execute(httppost, new checkInResponseHandler());
+		} catch (ClientProtocolException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			Message msg = handlerCheck.obtainMessage();
+			msg.arg1 = 2;
+			msg.arg2 = 1;
+			handlerCheck.sendMessage(msg);
+			mPrgsDlg.cancel();
+			this.mCheckInThread.interrupt();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+
+			Message msg = handlerCheck.obtainMessage();
+			msg.arg1 = 2;
+			msg.arg2 = 2;
+			handlerCheck.sendMessage(msg);
+			mPrgsDlg.cancel();
+
+		}
+	}
+
+	class checkInResponseHandler implements ResponseHandler<Object> {
+		@Override
+		public Object handleResponse(HttpResponse response)
+				throws ClientProtocolException, IOException {
+			HttpEntity r_entity = response.getEntity();
+			String responseString = EntityUtils.toString(r_entity);
+			// Log.d("UPLOAD", responseString);
+
+			Message msg1 = mPgsHdler.obtainMessage();
+			msg1.arg1 = 1;
+			mPgsHdler.sendMessage(msg1);
+
+			if (responseString.equalsIgnoreCase("ok")) {
+				Message msg = handlerCheck.obtainMessage();
+				msg.arg1 = 1;
+				handlerCheck.sendMessage(msg);
+				try {
+
+				} catch (Exception e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			} else {
+				Message msg = handlerCheck.obtainMessage();
+				msg.arg1 = 2;
+				handlerCheck.sendMessage(msg);
+			}
+
+			return null;
+		}
+	}
+
+	private void uploadStartAlert() {
+		/*
+		 * if(!isConnectedToServer(mHostName, 5000)) {
+		 * 
+		 * return; }
+		 */
+
+		AlertDialog.Builder alertDialogBuilder = new AlertDialog.Builder(
+				MainActivity.this);
+		alertDialogBuilder.setTitle(this.getTitle() + " upload");
+
+		ArrayList<String> trackFiles = mTransFileWriter.findTrackFiles();
+		if (trackFiles.isEmpty()) {
+			alertDialogBuilder.setMessage("No tracking file found");
+			alertDialogBuilder.setPositiveButton("Ok",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int id) {
+							// go to a new activity
+							dialog.cancel();
+						}
+					});
+		} else {
+			alertDialogBuilder
+					.setMessage("Do you want to upload tracking file?");
+
+			// Setting Icon to Dialog
+			// http://www.androidhive.info/2011/09/how-to-show-alert-dialog-in-android/
+			// alertDialogBuilder.setIcon(R.drawable.save);
+
+			// Setting Positive "Yes" Button
+			alertDialogBuilder.setPositiveButton("Yes",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int which) {
+							if (mTrackScheduleTaskExecutor != null) {
+								mTrackScheduleTaskExecutor.shutdown();
+								mTrackScheduleTaskExecutor = null;
+								startAmbientRecording();
+							}
+							upload();
+						}
+					});
+
+			// Setting Netural "Cancel" Button
+			alertDialogBuilder.setNeutralButton("Cancel",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int which) {
+
+						}
+					});
+		}
+
+		AlertDialog alertDialog = alertDialogBuilder.create();
+		alertDialog.show();
+	}
+
+	
+
+	public void upload() {
+		mUploadThread = new Thread(new Runnable() {
+			public void run() {
+				runOnUiThread(new Runnable() {
+					public void run() {
+					}
+				});
+				upload_to_server2();
+			}
+		});
+
+		mUploadThread.start();
+	}
+
+	public void upload_to_server2() {
+
+		try {
+			ArrayList<String> pTrackFiles = mTransFileWriter.mValidTrackFiles;
+			if (!pTrackFiles.isEmpty()) {
+				Message msg1 = mPgsHdler.obtainMessage();
+				msg1.arg1 = 2;
+				mPgsHdler.sendMessage(msg1);
+
+				MultipartEntityBuilder builder = MultipartEntityBuilder
+						.create();
+				builder.setMode(HttpMultipartMode.BROWSER_COMPATIBLE);
+
+				builder.addTextBody("pAction", "TransUploadTraj",
+						ContentType.APPLICATION_JSON);
+				builder.addTextBody("pDeviceID", this.mDeviceID,
+						ContentType.APPLICATION_JSON);
+
+				for (int i = 0; i < pTrackFiles.size(); i++) {
+					String pTrackFileName = mTransFileWriter.transRootDirStr
+							+ "/" + pTrackFiles.get(i);
+					File pTrackFile = new File(pTrackFileName);
+					FileBody fileBody = new FileBody(pTrackFile);
+					builder.addPart("userfile" + i, fileBody);
+				}
+
+				HttpEntity myEntity = builder.build();
+
+				HttpParams params = new BasicHttpParams();
+				params.setParameter(CoreProtocolPNames.PROTOCOL_VERSION,
+						HttpVersion.HTTP_1_1);
+				HttpClient httpclient = new DefaultHttpClient(params);
+				String pURL = getString(R.string.mHostURL);
+				HttpPost httppost = new HttpPost(pURL);
+
+				httppost.setEntity(myEntity);
+				httpclient.execute(httppost, new FileUploadResponseHandler());
+			} else {
+				mUploadThread.interrupt();
+			}
+		} catch (Exception e) {
+			Log.e(e.toString(), e.getLocalizedMessage(), e);
+
+			Message msg1 = mPgsHdler.obtainMessage();
+			msg1.arg1 = 1;
+			mPgsHdler.sendMessage(msg1);
+
+			mUploadThread.interrupt();
+		}
+	}
+
+	class FileUploadResponseHandler implements ResponseHandler<Object> {
+		@Override
+		public Object handleResponse(HttpResponse response)
+				throws ClientProtocolException, IOException {
+			HttpEntity r_entity = response.getEntity();
+			String responseString = EntityUtils.toString(r_entity);
+			// Log.d("UPLOAD", responseString);
+
+			Message msg1 = mPgsHdler.obtainMessage();
+			msg1.arg1 = 1;
+			mPgsHdler.sendMessage(msg1);
+
+			if (responseString.equalsIgnoreCase("ok")) {
+				Message msg = handler.obtainMessage();
+				msg.arg1 = 1;
+				handler.sendMessage(msg);
+				try {
+
+					mTransFileWriter.updateUploadFiles();
+
+				} catch (Exception e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			} else {
+				Message msg = handler.obtainMessage();
+				msg.arg1 = 2;
+				handler.sendMessage(msg);
+			}
+
+			return null;
+		}
+	}
+
+	private void trackAlert() {
+		AlertDialog.Builder alertDialogBuilder = new AlertDialog.Builder(
+				MainActivity.this);
+		alertDialogBuilder.setTitle(this.getTitle() + " Tracker");
+		if (mTrackScheduleTaskExecutor != null) {
+			alertDialogBuilder.setMessage("Tracking in process. Stop?"); // or
+																			// resume
+
+			// Setting Negative "NO" Button
+			alertDialogBuilder.setNegativeButton("Cancel",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int which) {
+							dialog.cancel();
+						}
+					});
+
+			/*
+			 * alertDialogBuilder.setNeutralButton("Pause", new
+			 * DialogInterface.OnClickListener() { public void
+			 * onClick(DialogInterface dialog, int which) { dialog.cancel();
+			 * scheduleTaskExecutor.shutdown(); scheduleTaskExecutor = null;
+			 * startAmbientRecording(); } });
+			 */
+
+			// Setting Positive "Yes" Button
+			alertDialogBuilder.setPositiveButton("Stop",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int which) {
+							// User pressed YES button. Write Logic Here
+							dialog.cancel();
+							mTrackScheduleTaskExecutor.shutdown();
+							mTrackScheduleTaskExecutor = null;
+							// remove track icon to upper-left!
+							// removeNotifyIcon();
+							Toast.makeText(getApplicationContext(),
+									"Tracking stopped", Toast.LENGTH_SHORT)
+									.show();
+						}
+					});
+
+		} else {
+			alertDialogBuilder.setMessage("Start tracking?");
+
+			// set negative button: No message
+			alertDialogBuilder.setNegativeButton("Cancel",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int id) {
+							// cancel the alert box and put a Toast to the user
+							dialog.cancel();
+						}
+					});
+
+			alertDialogBuilder.setPositiveButton("Yes",
+					new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface dialog, int id) {
+							dialog.cancel();
+							startAmbientRecording();
+						}
+					});
+		}
+		AlertDialog alertDialog = alertDialogBuilder.create();
+		// show alert
+		alertDialog.show();
+	}
+
+	@SuppressLint("SimpleDateFormat")
+	public void startAmbientRecording() {
+		SimpleDateFormat s = new SimpleDateFormat("yyyyMMMdd-KKmmss");
+		String dateStr = s.format(new Date());
+		String currTrackFileName = "Translab_" + dateStr + ".txt";
+		if (!mTransFileWriter.checkCurrTrackFile(currTrackFileName)) {
+
+			return;
+		}
+
+		Toast.makeText(getApplicationContext(), "Tracking started",
+				Toast.LENGTH_LONG).show();
+
+		// setupNotifyIcon();
+
+		mTrackScheduleTaskExecutor = Executors.newScheduledThreadPool(mTrackFreq);
+		// This schedule a runnable task every mTrackFreq (3) seconds
+		mTrackScheduleTaskExecutor.scheduleAtFixedRate(new Runnable() {
+			public void run() {
+				runOnUiThread(new Runnable() {
+					@Override
+					public void run() {
+						showRecordInfo("");
+					}
+				});
+
+			}
+		}, 5, 5, TimeUnit.SECONDS);
+
+	}
+
+	@SuppressLint("SimpleDateFormat")
+	public void showRecordInfo(String currTrackFileName) {
+		GNAmbientRecorder record = new GNAmbientRecorder();
+		double db = record.getNoiseLevel();
+
+		SimpleDateFormat s = new SimpleDateFormat("dd-MMM-yyyy KK:mm:ss");
+		String format = s.format(new Date());
+		String result = mLocation.getLatitude() + "; "
+				+ mLocation.getLongitude() + "; " + db + "; " + mLight + "; "
+				+ format + "\r\n";
+		mNoiseLevel.setText("LAT: " + mLocation.getLatitude() + "; LON: "
+				+ mLocation.getLongitude() + /* "; DB:" + db + */"; Time: "
+				+ format + "");
+
+		// Toast.makeText(getApplicationContext(), "LAT: " +
+		// mLocation.getLatitude() + "; LON: " + mLocation.getLongitude(),
+		// Toast.LENGTH_SHORT).show();
+		mTransFileWriter.WriteTrackString(result);
+	}
+
+	private void setUpMapIfNeeded() {
+		// Do a null check to confirm that we have not already instantiated the
+		// map.
+		if (mMap == null) {
+			// Try to obtain the map from the SupportMapFragment.
+			android.support.v4.app.Fragment fragment = getSupportFragmentManager()
+					.findFragmentById(R.id.map);
+			mMap = ((SupportMapFragment) fragment).getMap();
+			// Check if we were successful in obtaining the map.
+			if (mMap != null) {
+				mMap.setMyLocationEnabled(true);
+			}
+		}
+	}
+
+	private void setUpLocationClientIfNeeded() {
+		if (mLocationClient == null) {
+			mLocationClient = new LocationClient(getApplicationContext(), this,
+					this); // OnConnectionFailedListener
+		}
+	}
+
+	/*
+	 * private Boolean isConnectedToServer(String url, int timeout) { try{ URL
+	 * myUrl = new URL(url); URLConnection connection = myUrl.openConnection();
+	 * connection.setConnectTimeout(timeout); connection.connect(); return true;
+	 * } catch (Exception e) { // Handle your exceptions return false; } }
+	 * 
+	 * private Boolean checkServer() { int timeOut = 5000; //milliseconds try {
+	 * return InetAddress.getByName(mHostName).isReachable(timeOut); } catch
+	 * (UnknownHostException e) { // TODO Auto-generated catch block
+	 * e.printStackTrace(); } catch (IOException e) { // TODO Auto-generated
+	 * catch block e.printStackTrace(); } return false; }
+	 */
+}
